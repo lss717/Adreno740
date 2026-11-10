@@ -30,7 +30,9 @@ enum {
     NativeAdrenoMethodBoCpuUnmap = 14,
     NativeAdrenoMethodGetDeviceInfo = 15,
     NativeAdrenoMethodBoImport = 16,
+    NativeAdrenoMethodLog = 17,       /* H236fu: userspace trace line into the kernel log */
     NativeAdrenoAbiMetadataBytes = 64,
+    NativeAdrenoAbiLogBytes = 184,
     NativeAdrenoAbiMaxQueues = 8
 };
 struct NativeAdrenoAbiParams {
@@ -84,6 +86,14 @@ struct NativeAdrenoAbiSubmit {
     uint64_t wait_fence;          /* zero or an earlier fence of this client */
     uint64_t wait_timeout_ns;     /* used only when wait_fence is nonzero */
     NativeAdrenoAbiSubmitBuffer buffers[NativeAdrenoAbiMaxBuffers];
+};
+/* H236fu: one trace line from a userspace plugin into the kernel log. The
+ * driver copies `bytes` characters, replaces line breaks, NUL-terminates and
+ * IOLogs it; the text is never used as a format string. */
+struct NativeAdrenoAbiLog {
+    uint32_t bytes;               /* characters used, <= NativeAdrenoAbiLogBytes */
+    uint32_t reserved;            /* zero */
+    char text[NativeAdrenoAbiLogBytes];
 };
 struct NativeAdrenoAbiMetadata {
     uint64_t handle;              /* object identity */
