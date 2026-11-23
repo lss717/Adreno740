@@ -11,6 +11,9 @@ static bool outputWidth(unsigned bits)
 /* Where the last import stopped (10..19, 19 = done), and for a refused page the physical address and offset: the board log shows them. */
 enum : IOReturn {kNativeAdrenoProtectionFailure=2};   /* KERN_PROTECTION_FAILURE, as prepare() reports a range that cannot be wired for writing */
 extern "C" {volatile uint32_t native_adreno_pool_mib=0,native_adreno_pool_status=0;volatile uint32_t native_adreno_import_stage;volatile uint64_t native_adreno_import_fail_pa,native_adreno_import_fail_offset;}
+/* H603: last allocate() failure branch snapshot {stage,physical,limit,offset}; always overwritten. */
+extern "C" {volatile uint64_t native_adreno_alloc_last[4];}
+static inline void noteAllocLast(uint64_t stage,uint64_t phys,uint64_t limit,uint64_t off){native_adreno_alloc_last[0]=stage;native_adreno_alloc_last[1]=phys;native_adreno_alloc_last[2]=limit;native_adreno_alloc_last[3]=off;}
 /* The pool (see reservePool): a free list of page extents over one contiguous block; best fit, neighbours merged on release. */
 extern "C" {volatile uint32_t native_adreno_pool_stats[8];}
 /* The pool's write-combine (writeCombinePool): bit 31 once tried, the low bits its status. */
@@ -127,30 +130,30 @@ IOReturn NativeAdrenoMemory::allocate(size_t bytes,unsigned bits,bool contiguous
     IOOptionBits options=static_cast<IOOptionBits>(kIODirectionInOut)|static_cast<IOOptionBits>(kIOMemoryMapperNone);
     if(contiguous)options|=kIOMemoryPhysicallyContiguous;
     descriptor_=IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,options,bytes,(limit-1)&~UINT64_C(4095));
-    if(!descriptor_)return kIOReturnNoMemory;
+    if(!descriptor_){noteAllocLast(3,0,limit,0);return kIOReturnNoMemory;}
     status=descriptor_->prepare();
-    if(status!=kIOReturnSuccess) {descriptor_->release();descriptor_=nullptr;return status;}
+    if(status!=kIOReturnSuccess) {noteAllocLast(4,0,limit,0);descriptor_->release();descriptor_=nullptr;return status;}
     prepared_=true;bytes_=bytes;mapping_=descriptor_->getBytesNoCopy();
     status=kIOReturnUnsupported;
     if(!mapping_ || ((uintptr_t)mapping_&4095) || bytes>UINTPTR_MAX-(uintptr_t)mapping_ ||
-        descriptor_->getLength()!=bytes)goto failed;
+        descriptor_->getLength()!=bytes){noteAllocLast(5,0,limit,0);goto failed;}
     span_capacity_=bytes/4096;
     spans_=IONewData(NativeAdrenoPhysicalSpan,span_capacity_);
-    if(!spans_) {status=kIOReturnNoMemory;goto failed;}
+    if(!spans_) {status=kIOReturnNoMemory;noteAllocLast(6,0,limit,0);goto failed;}
     for(size_t offset=0;offset<bytes;offset+=4096) {
         IOByteCount length=0;
         addr64_t physical=descriptor_->getPhysicalSegment(offset,&length,kIOMemoryMapperNone);
         if(!physical || (physical&4095) || length<4096 || physical>=limit || 4096>limit-physical)
-            {status=kIOReturnUnsupported;goto failed;}
+            {status=kIOReturnUnsupported;noteAllocLast(7,physical,limit,offset);goto failed;}
         if(contiguous && offset && physical!=spans_[0].physical+offset)
-            {status=kIOReturnUnsupported;goto failed;}
+            {status=kIOReturnUnsupported;noteAllocLast(8,physical,limit,offset);goto failed;}
         if(span_count_ && physical==spans_[span_count_-1].physical+spans_[span_count_-1].bytes)
             spans_[span_count_-1].bytes+=4096;
         else spans_[span_count_++]={offset,physical,4096};
     }
     bzero(mapping_,bytes);
     status=NativeAdrenoMaintainOwnedPages(mapping_,bytes,NativeAdrenoClean);
-    if(status!=kIOReturnSuccess)goto failed;
+    if(status!=kIOReturnSuccess){noteAllocLast(9,0,limit,0);goto failed;}
     native_adreno_pool_stats[5]=native_adreno_pool_stats[5]+1;native_adreno_pool_stats[6]=native_adreno_pool_stats[6]+(uint32_t)span_count_;
     return kIOReturnSuccess;
 failed:

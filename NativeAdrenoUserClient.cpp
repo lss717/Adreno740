@@ -22,6 +22,9 @@ static void noteImport(IOReturn status,uint32_t stage,uint64_t bytes,uint64_t ad
 #include <IOKit/IOLib.h>
 #include <string.h>
 extern "C" {volatile uint32_t native_adreno_window_overflow[4][3];}   /* {count, last size KiB, last end MiB} per client window */
+/* H603: first user BoAlloc failure latch. [0] count, [1] rc, [2] bytes, [3] align|contig<<8|prefer<<9, [4] step (2=scatter alloc,3=wc), [5..8] allocate branch snapshot, [9] output_bits. */
+extern "C" {volatile uint64_t native_adreno_bo_diag[10];}
+extern "C" {extern volatile uint64_t native_adreno_alloc_last[4];}
 NativeAdrenoUserClient::Entry *NativeAdrenoUserClient::find(uint64_t handle)
 {
     if(handle)for(size_t i=0;i<entry_count_;++i)if(entries_[i].used && entries_[i].handle==handle)return &entries_[i];
@@ -148,21 +151,31 @@ IOReturn NativeAdrenoUserClient::allocBo(const NativeAdrenoAbiBoAlloc *request,
     /* A scattered allocation costs one VM span per physical page (int-030: 16 MiB came back as 4096 single-page spans, the
      * whole span table), so larger objects try one contiguous run first and fall back to scattered pages unless the
      * caller demanded contiguity. */
-    IOReturn status=kIOReturnUnsupported;
+    IOReturn status=kIOReturnUnsupported;unsigned bo_step=0;
     const bool prefer_contiguous=request->contiguous==0 && request->bytes>=NativeAdrenoClientContiguousFirstBytes;
     if(prefer_contiguous) {
         status=entry->memory.allocate((size_t)request->bytes,output_bits_,true,(size_t)request->bytes,true);
         if(status && !entry->memory.quarantined() && entry->memory.release()==kIOReturnSuccess)status=kIOReturnUnsupported;
     }
-    if(status)
+    if(status) {
+        bo_step=2;
         status=entry->memory.allocate((size_t)request->bytes,output_bits_,request->contiguous!=0,(size_t)request->bytes,true);
+    }
     /* User BOs are write-combined for the CPU, as the GPU maps them non-cacheable: no per-submission cache maintenance.
      * int-147 kept them cacheable under IO coherence and mapped the GPU side write-back: the first Turnip IB executed zeros and the GPU hung
      * (the kernel's cacheable alias read zeros past the first line too). Turnip maps every BO asking kIOMapWriteCombineCache, the user's
      * cache bits replace the kernel's (IOUserClient::mapClientMemory64), and XNU's view machinery changes the page attribute to match, so
      * the aliases disagreed. A coherent own BO needs a client that asks for a write-back view. */
-    if(!status && native_adreno_wc_enabled)status=entry->memory.makeWriteCombined();
+    if(!status && native_adreno_wc_enabled){bo_step=3;status=entry->memory.makeWriteCombined();}
     if(status) {
+        native_adreno_bo_diag[0]=native_adreno_bo_diag[0]+1;
+        if(native_adreno_bo_diag[0]==1) {
+            native_adreno_bo_diag[1]=(uint32_t)status;native_adreno_bo_diag[2]=request->bytes;
+            native_adreno_bo_diag[3]=request->align_log2|((uint64_t)request->contiguous<<8)|((uint64_t)prefer_contiguous<<9);
+            native_adreno_bo_diag[4]=bo_step;native_adreno_bo_diag[5]=native_adreno_alloc_last[0];
+            native_adreno_bo_diag[6]=native_adreno_alloc_last[1];native_adreno_bo_diag[7]=native_adreno_alloc_last[2];
+            native_adreno_bo_diag[8]=native_adreno_alloc_last[3];native_adreno_bo_diag[9]=output_bits_;
+        }
         /* A failed allocation can leave quarantine behind; never reuse it. */
         clear(*entry);
         if(entry->memory.release()!=kIOReturnSuccess) {
